@@ -25,10 +25,9 @@ PRODUCT_URL = (
     "https://www.apple.com/shop/buy-iphone/iphone-duo/"
     "7.6-inch-display-512gb-night-sky-unlocked"
 )
-# Apple's combined /shop/fulfillment-messages endpoint now rejects non-browser
-# requests (HTTP 541), so pickup and delivery are queried separately.
+# Apple's /shop/fulfillment-messages endpoint now rejects non-browser requests
+# (HTTP 541); this one returns the same per-store pickup data.
 PICKUP_URL = "https://www.apple.com/shop/pickup-message-recommendations"
-DELIVERY_URL = "https://www.apple.com/shop/delivery-message"
 DEFAULT_INTERVAL = 5 * 60
 
 USER_AGENT = (
@@ -72,10 +71,6 @@ def fetch_pickup(zip_code):
     })
 
 
-def fetch_delivery():
-    return fetch_json(DELIVERY_URL, {"parts.0": PART_NUMBER, "mt": "regular"})
-
-
 def parse_pickup(data, part=PART_NUMBER):
     """Return [(store name, city, quote)] for stores with the part available for pickup."""
     pickup = (data.get("body") or {}).get("PickupMessage") or {}
@@ -86,22 +81,6 @@ def parse_pickup(data, part=PART_NUMBER):
             quote = info.get("pickupSearchQuote") or info.get("storePickupQuote") or ""
             stores.append((store.get("storeName", "?"), store.get("city", ""), strip_html(quote)))
     return stores
-
-
-def parse_delivery(data, part=PART_NUMBER):
-    """Return the online delivery estimate, e.g. "Ships Mon, Jan 25", or None."""
-    msg = ((data.get("body") or {}).get("content") or {}).get("deliveryMessage") or {}
-    regular = (msg.get(part) or {}).get("regular") or {}
-    if not regular:
-        return None
-    if regular.get("buyability", {}).get("isBuyable") is False:
-        return "Not buyable online"
-    if regular.get("stickyMessageSTH"):
-        return strip_html(regular["stickyMessageSTH"])
-    for option in regular.get("deliveryOptionMessages") or []:
-        if option.get("displayName"):
-            return strip_html(option["displayName"])
-    return None
 
 
 def strip_html(text):
@@ -135,38 +114,27 @@ def log(msg):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
 
-def safe_fetch(what, fn, *args):
-    try:
-        return fn(*args)
-    except BlockedError as e:
-        log(f"Apple blocked the {what} request ({e}).")
-    except Exception as e:
-        log(f"{what.capitalize()} request failed: {e}")
-    return None
-
-
 def check_once(args, state):
-    pickup_data = safe_fetch("pickup", fetch_pickup, args.zip)
-    if pickup_data is not None:
-        stores = parse_pickup(pickup_data)[: args.max_stores]
-        if stores:
-            lines = [f"{name} ({city}) {quote}".strip() for name, city, quote in stores]
-            log("IN STOCK for pickup: " + "; ".join(lines))
-            names = tuple(s[0] for s in stores)
-            if names != state.get("stores"):
-                notify(f"{PRODUCT_NAME} in stock!", "Pickup at: " + ", ".join(names), args.ntfy)
-            state["stores"] = names
-        else:
-            log(f"No pickup availability near {args.zip}.")
-            state["stores"] = ()
+    try:
+        data = fetch_pickup(args.zip)
+    except BlockedError as e:
+        log(f"Apple blocked the request ({e}).")
+        return
+    except Exception as e:
+        log(f"Request failed: {e}")
+        return
 
-    delivery_data = safe_fetch("delivery", fetch_delivery)
-    delivery = parse_delivery(delivery_data) if delivery_data is not None else None
-    if delivery:
-        log(f"Online delivery: {delivery}")
-        if state.get("delivery") not in (None, delivery):
-            notify(f"{PRODUCT_NAME} delivery changed", f"{state['delivery']} -> {delivery}", args.ntfy)
-        state["delivery"] = delivery
+    stores = parse_pickup(data)[: args.max_stores]
+    if stores:
+        lines = [f"{name} ({city}) {quote}".strip() for name, city, quote in stores]
+        log("IN STOCK for pickup: " + "; ".join(lines))
+        names = tuple(s[0] for s in stores)
+        if names != state.get("stores"):
+            notify(f"{PRODUCT_NAME} in stock!", "Pickup at: " + ", ".join(names), args.ntfy)
+        state["stores"] = names
+    else:
+        log(f"No pickup availability near {args.zip}.")
+        state["stores"] = ()
 
 
 def main(argv=None):

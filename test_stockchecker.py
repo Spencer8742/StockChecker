@@ -1,6 +1,6 @@
 import unittest
 
-from stockchecker import PART_NUMBER, parse_delivery, parse_pickup
+from stockchecker import PART_NUMBER, parse_pickup
 
 
 def pickup_response(stores):
@@ -18,10 +18,6 @@ def pickup_response(stores):
             }
         }
     }
-
-
-def delivery_response(regular):
-    return {"body": {"content": {"deliveryMessage": {PART_NUMBER: {"regular": regular}}}}}
 
 
 class ParsePickupTest(unittest.TestCase):
@@ -45,27 +41,6 @@ class ParsePickupTest(unittest.TestCase):
 
     def test_empty_response(self):
         self.assertEqual(parse_pickup({}), [])
-
-
-class ParseDeliveryTest(unittest.TestCase):
-    def test_ships_message(self):
-        data = delivery_response({
-            "buyability": {"isBuyable": True},
-            "stickyMessageSTH": 'Ships <span class="bold">Mon, Jan 25</span>',
-            "deliveryOptionMessages": [{"displayName": "Mon, Jan 25 — Free"}],
-        })
-        self.assertEqual(parse_delivery(data), "Ships Mon, Jan 25")
-
-    def test_falls_back_to_delivery_option(self):
-        data = delivery_response({"deliveryOptionMessages": [{"displayName": "Mon, Jan 25 — Free"}]})
-        self.assertEqual(parse_delivery(data), "Mon, Jan 25 — Free")
-
-    def test_not_buyable(self):
-        data = delivery_response({"buyability": {"isBuyable": False}})
-        self.assertEqual(parse_delivery(data), "Not buyable online")
-
-    def test_empty_response(self):
-        self.assertIsNone(parse_delivery({}))
 
 
 if __name__ == "__main__":
