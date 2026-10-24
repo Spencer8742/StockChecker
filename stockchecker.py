@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -24,7 +25,10 @@ PRODUCT_URL = (
     "https://www.apple.com/shop/buy-iphone/iphone-duo/"
     "7.6-inch-display-512gb-night-sky-unlocked"
 )
-FULFILLMENT_URL = "https://www.apple.com/shop/fulfillment-messages"
+# Apple's combined /shop/fulfillment-messages endpoint now rejects non-browser
+# requests (HTTP 541), so pickup and delivery are queried separately.
+PICKUP_URL = "https://www.apple.com/shop/pickup-message-recommendations"
+DELIVERY_URL = "https://www.apple.com/shop/delivery-message"
 DEFAULT_INTERVAL = 5 * 60
 
 USER_AGENT = (
@@ -34,23 +38,12 @@ USER_AGENT = (
 
 
 class BlockedError(Exception):
-    """Apple refused the request (usually HTTP 541 from a datacenter/VPN IP)."""
+    """Apple refused the request (HTTP 541/403 or a non-JSON block page)."""
 
 
-def fetch_fulfillment(zip_code, carrier):
-    params = {
-        "fae": "true",
-        "pl": "true",
-        "mts.0": "regular",
-        "mts.1": "compact",
-        "parts.0": PART_NUMBER,
-        "cppart": carrier,
-        "searchNearby": "true",
-        "location": zip_code,
-    }
-    url = FULFILLMENT_URL + "?" + urllib.parse.urlencode(params, safe="/")
+def fetch_json(url, params):
     req = urllib.request.Request(
-        url,
+        url + "?" + urllib.parse.urlencode(params, safe="/"),
         headers={
             "User-Agent": USER_AGENT,
             "Accept": "application/json",
@@ -70,34 +63,49 @@ def fetch_fulfillment(zip_code, carrier):
         raise BlockedError("non-JSON response (likely a block page)") from e
 
 
-def parse_availability(data, part=PART_NUMBER):
-    """Return {"stores": [(name, city, quote)], "delivery": str|None}.
+def fetch_pickup(zip_code):
+    return fetch_json(PICKUP_URL, {
+        "mts.0": "regular",
+        "searchNearby": "true",
+        "location": zip_code,
+        "product": PART_NUMBER,
+    })
 
-    "stores" only lists stores where the part is available for pickup.
-    """
-    content = (data.get("body") or {}).get("content") or {}
 
+def fetch_delivery():
+    return fetch_json(DELIVERY_URL, {"parts.0": PART_NUMBER, "mt": "regular"})
+
+
+def parse_pickup(data, part=PART_NUMBER):
+    """Return [(store name, city, quote)] for stores with the part available for pickup."""
+    pickup = (data.get("body") or {}).get("PickupMessage") or {}
     stores = []
-    for store in (content.get("pickupMessage") or {}).get("stores") or []:
+    for store in pickup.get("stores") or []:
         info = (store.get("partsAvailability") or {}).get(part) or {}
         if info.get("pickupDisplay") == "available":
             quote = info.get("pickupSearchQuote") or info.get("storePickupQuote") or ""
-            stores.append((store.get("storeName", "?"), store.get("city", ""), quote))
+            stores.append((store.get("storeName", "?"), store.get("city", ""), strip_html(quote)))
+    return stores
 
-    msg = (content.get("deliveryMessage") or {}).get(part) or {}
-    regular = msg.get("regular") or {}
-    delivery = None
+
+def parse_delivery(data, part=PART_NUMBER):
+    """Return the online delivery estimate, e.g. "Ships Mon, Jan 25", or None."""
+    msg = ((data.get("body") or {}).get("content") or {}).get("deliveryMessage") or {}
+    regular = (msg.get(part) or {}).get("regular") or {}
+    if not regular:
+        return None
     if regular.get("buyability", {}).get("isBuyable") is False:
-        delivery = "Not buyable online"
-    else:
-        for option in regular.get("deliveryOptionMessages") or []:
-            delivery = option.get("displayName")
-            if delivery:
-                break
-        if not delivery:
-            delivery = (msg.get("compact") or {}).get("quote") or regular.get("stickyMessageSTH")
+        return "Not buyable online"
+    if regular.get("stickyMessageSTH"):
+        return strip_html(regular["stickyMessageSTH"])
+    for option in regular.get("deliveryOptionMessages") or []:
+        if option.get("displayName"):
+            return strip_html(option["displayName"])
+    return None
 
-    return {"stores": stores, "delivery": delivery}
+
+def strip_html(text):
+    return re.sub(r"<[^>]+>", "", text).strip()
 
 
 def notify(title, message, ntfy_topic=None):
@@ -127,41 +135,44 @@ def log(msg):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
 
-def check_once(args, state):
+def safe_fetch(what, fn, *args):
     try:
-        data = fetch_fulfillment(args.zip, args.carrier)
+        return fn(*args)
     except BlockedError as e:
-        log(f"Apple blocked the request ({e}). Run this from a home network, not a VPN/cloud server.")
-        return
+        log(f"Apple blocked the {what} request ({e}).")
     except Exception as e:
-        log(f"Request failed: {e}")
-        return
+        log(f"{what.capitalize()} request failed: {e}")
+    return None
 
-    result = parse_availability(data)
-    stores = result["stores"][: args.max_stores]
-    delivery = result["delivery"]
 
-    if stores:
-        lines = [f"{name} ({city}) {quote}".strip() for name, city, quote in stores]
-        log("IN STOCK for pickup: " + "; ".join(lines))
-        names = tuple(s[0] for s in stores)
-        if names != state.get("stores"):
-            notify(f"{PRODUCT_NAME} in stock!", "Pickup at: " + ", ".join(names), args.ntfy)
-        state["stores"] = names
-    else:
-        log(f"No pickup availability near {args.zip}. Delivery: {delivery or 'unknown'}")
-        state["stores"] = ()
+def check_once(args, state):
+    pickup_data = safe_fetch("pickup", fetch_pickup, args.zip)
+    if pickup_data is not None:
+        stores = parse_pickup(pickup_data)[: args.max_stores]
+        if stores:
+            lines = [f"{name} ({city}) {quote}".strip() for name, city, quote in stores]
+            log("IN STOCK for pickup: " + "; ".join(lines))
+            names = tuple(s[0] for s in stores)
+            if names != state.get("stores"):
+                notify(f"{PRODUCT_NAME} in stock!", "Pickup at: " + ", ".join(names), args.ntfy)
+            state["stores"] = names
+        else:
+            log(f"No pickup availability near {args.zip}.")
+            state["stores"] = ()
 
-    if delivery and state.get("delivery") not in (None, delivery):
-        notify(f"{PRODUCT_NAME} delivery changed", f"{state['delivery']} -> {delivery}", args.ntfy)
-    state["delivery"] = delivery or state.get("delivery")
+    delivery_data = safe_fetch("delivery", fetch_delivery)
+    delivery = parse_delivery(delivery_data) if delivery_data is not None else None
+    if delivery:
+        log(f"Online delivery: {delivery}")
+        if state.get("delivery") not in (None, delivery):
+            notify(f"{PRODUCT_NAME} delivery changed", f"{state['delivery']} -> {delivery}", args.ntfy)
+        state["delivery"] = delivery
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=f"Apple Store stock checker for {PRODUCT_NAME} ({PART_NUMBER}).")
     p.add_argument("--zip", default=os.environ.get("STOCK_ZIP"), help="US ZIP code to search nearby stores (or STOCK_ZIP env)")
     p.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, help="seconds between checks (default 300)")
-    p.add_argument("--carrier", default="UNLOCKED/US", help="UNLOCKED/US (default), ATT_IPHONEDUO, TMOBILE_IPHONEDUO, VERIZON_IPHONEDUO")
     p.add_argument("--ntfy", default=os.environ.get("NTFY_TOPIC"), help="ntfy.sh topic for phone push notifications (or NTFY_TOPIC env)")
     p.add_argument("--max-stores", type=int, default=12, help="max nearby stores to report")
     p.add_argument("--once", action="store_true", help="check once and exit (for cron)")

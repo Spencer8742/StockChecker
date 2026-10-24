@@ -1,60 +1,71 @@
 import unittest
 
-from stockchecker import PART_NUMBER, parse_availability
+from stockchecker import PART_NUMBER, parse_delivery, parse_pickup
 
 
-def response(stores=(), delivery=None):
+def pickup_response(stores):
     return {
         "body": {
-            "content": {
-                "pickupMessage": {
-                    "stores": [
-                        {
-                            "storeName": name,
-                            "city": city,
-                            "partsAvailability": {
-                                PART_NUMBER: {"pickupDisplay": display, "pickupSearchQuote": quote}
-                            },
-                        }
-                        for name, city, display, quote in stores
-                    ]
-                },
-                "deliveryMessage": {PART_NUMBER: delivery} if delivery is not None else {},
+            "PickupMessage": {
+                "stores": [
+                    {
+                        "storeName": name,
+                        "city": city,
+                        "partsAvailability": availability,
+                    }
+                    for name, city, availability in stores
+                ]
             }
         }
     }
 
 
-class ParseAvailabilityTest(unittest.TestCase):
+def delivery_response(regular):
+    return {"body": {"content": {"deliveryMessage": {PART_NUMBER: {"regular": regular}}}}}
+
+
+class ParsePickupTest(unittest.TestCase):
     def test_only_available_stores_are_reported(self):
-        data = response(stores=[
-            ("Fifth Avenue", "New York", "available", "Available Today"),
-            ("SoHo", "New York", "unavailable", "Currently unavailable"),
+        data = pickup_response([
+            ("Evergreen Walk", "South Windsor",
+             {PART_NUMBER: {"pickupDisplay": "available", "pickupSearchQuote": "<b>Available</b> Today"}}),
+            ("Westfarms", "Farmington",
+             {PART_NUMBER: {"pickupDisplay": "unavailable", "pickupSearchQuote": "Currently unavailable"}}),
         ])
-        self.assertEqual(
-            parse_availability(data)["stores"],
-            [("Fifth Avenue", "New York", "Available Today")],
-        )
+        self.assertEqual(parse_pickup(data), [("Evergreen Walk", "South Windsor", "Available Today")])
 
-    def test_delivery_quote(self):
-        data = response(delivery={
-            "regular": {
-                "buyability": {"isBuyable": True},
-                "deliveryOptionMessages": [{"displayName": "Delivers Nov 7 - Nov 14"}],
-            }
-        })
-        self.assertEqual(parse_availability(data)["delivery"], "Delivers Nov 7 - Nov 14")
+    def test_empty_availability_means_no_stock(self):
+        # This is what Apple returns today when nothing nearby has the part.
+        data = pickup_response([("Evergreen Walk", "South Windsor", {}), ("Westfarms", "Farmington", {})])
+        self.assertEqual(parse_pickup(data), [])
 
-    def test_not_buyable(self):
-        data = response(delivery={"regular": {"buyability": {"isBuyable": False}}})
-        self.assertEqual(parse_availability(data)["delivery"], "Not buyable online")
-
-    def test_compact_fallback(self):
-        data = response(delivery={"regular": {}, "compact": {"quote": "Ships in 3-4 weeks"}})
-        self.assertEqual(parse_availability(data)["delivery"], "Ships in 3-4 weeks")
+    def test_other_parts_are_ignored(self):
+        data = pickup_response([("Holyoke", "Holyoke", {"MK1F4LL/A": {"pickupDisplay": "available"}})])
+        self.assertEqual(parse_pickup(data), [])
 
     def test_empty_response(self):
-        self.assertEqual(parse_availability({}), {"stores": [], "delivery": None})
+        self.assertEqual(parse_pickup({}), [])
+
+
+class ParseDeliveryTest(unittest.TestCase):
+    def test_ships_message(self):
+        data = delivery_response({
+            "buyability": {"isBuyable": True},
+            "stickyMessageSTH": 'Ships <span class="bold">Mon, Jan 25</span>',
+            "deliveryOptionMessages": [{"displayName": "Mon, Jan 25 — Free"}],
+        })
+        self.assertEqual(parse_delivery(data), "Ships Mon, Jan 25")
+
+    def test_falls_back_to_delivery_option(self):
+        data = delivery_response({"deliveryOptionMessages": [{"displayName": "Mon, Jan 25 — Free"}]})
+        self.assertEqual(parse_delivery(data), "Mon, Jan 25 — Free")
+
+    def test_not_buyable(self):
+        data = delivery_response({"buyability": {"isBuyable": False}})
+        self.assertEqual(parse_delivery(data), "Not buyable online")
+
+    def test_empty_response(self):
+        self.assertIsNone(parse_delivery({}))
 
 
 if __name__ == "__main__":
